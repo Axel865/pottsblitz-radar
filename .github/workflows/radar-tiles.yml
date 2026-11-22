@@ -1,0 +1,57 @@
+name: Render and publish DWD radar tiles
+
+# Renders the current DWD rain-radar composite as map tiles, zips them, and
+# uploads ONE zip file to the web server via FTPS; a small PHP endpoint there
+# then extracts it in place. Started every 5 minutes (minutes 4, 9, 14, ...)
+# from the server via workflow_dispatch — GitHub's own `schedule:` trigger is
+# too unreliable for this (runs get delayed or skipped).
+#
+# This lives in its own PUBLIC repository on purpose: Actions minutes are
+# unlimited for public repos, while the private main repo's free quota
+# (2,000 min/month) was used up in ~2.5 days by a 5-minute cadence.
+# Nothing secret is in here — credentials are repository secrets:
+#   RADAR_FTP_HOST, RADAR_FTP_USER, RADAR_FTP_PASS, RADAR_TRIGGER_TOKEN
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+# false: a run always gets to finish; a newer trigger queues instead of
+# cancelling the active run.
+concurrency:
+  group: radar-tiles
+  cancel-in-progress: false
+
+jobs:
+  render-and-upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r deploy/radar-tiles/requirements.txt
+
+      - name: Render tiles
+        run: python3 deploy/radar-tiles/render_tiles.py --out ./tiles
+
+      - name: Zip tiles
+        run: cd tiles && zip -rq ../radar-tiles.zip . && cd ..
+
+      - name: Upload zip via FTPS
+        run: |
+          curl --ftp-ssl --ftp-create-dirs -sS \
+            -u "${{ secrets.RADAR_FTP_USER }}:${{ secrets.RADAR_FTP_PASS }}" \
+            -T radar-tiles.zip \
+            "ftp://${{ secrets.RADAR_FTP_HOST }}/radar-tiles-private/incoming.zip"
+
+      - name: Trigger server-side extraction
+        run: |
+          RESP=$(curl -fsS "https://www.emscherwetter.de/radar-tiles-run.php?t=${{ secrets.RADAR_TRIGGER_TOKEN }}")
+          echo "Response: $RESP"
+          test "$RESP" = "ok"
