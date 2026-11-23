@@ -575,7 +575,8 @@ def main():
         from nowcast import build_nowcast
         by_minute = {int(re.search(r"_(\d+)-hd5", n).group(1)): n for n in latest_members}
         nc = build_nowcast(decode_member(latest_tar, by_minute[0]),
-                           decode_member(latest_tar, by_minute[30]), now_dt, generated_at)
+                           decode_member(latest_tar, by_minute[30]), now_dt, generated_at,
+                           decode_member(latest_tar, by_minute[60]) if 60 in by_minute else None)
         if nc:
             with open(os.path.join(args.out, "nowcast.json"), "w") as fh:
                 json.dump(nc, fh, separators=(",", ":"))

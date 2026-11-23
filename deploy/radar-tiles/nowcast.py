@@ -37,6 +37,8 @@ WET_FRACTION = 0.35   # share of wet 1 km pixels around a cell to count it as we
 MIN_CELLS = 15        # ignore specks smaller than ~15 cells (~190 km2)
 MAX_AREAS = 250       # ids are stored as small ints
 HORIZON_MINUTES = 30  # frame pair used for the motion measurement: now -> +30 min
+SLOW_KMH = 8          # slower areas are measured again over +60 min: twice the
+                      # displacement, so twice the precision for slow movers
 MIN_PEAK = 0.10       # phase-correlation peak needed to trust a measurement
 MAX_SHIFT_PX = 45     # 45 km per 30 min = 90 km/h upper bound
 
@@ -162,7 +164,7 @@ def _bearing_speed(frame, drow, dcol, crow, ccol, minutes):
     return bearing, dist_km * 60.0 / minutes
 
 
-def build_nowcast(frame_now, frame_future, now_dt, generated_at):
+def build_nowcast(frame_now, frame_future, now_dt, generated_at, frame_future60=None):
     """Returns the nowcast.json dict, or None if there is no usable
     precipitation."""
     lats = LAT0 + DLAT * (np.arange(int(round((LAT1 - LAT0) / DLAT))) + 0.5)
@@ -195,6 +197,7 @@ def build_nowcast(frame_now, frame_future, now_dt, generated_at):
     ids = remap[labels]
 
     fa, fb = _prep(frame_now), _prep(frame_future)
+    fc = _prep(frame_future60) if frame_future60 is not None else None
     minutes = HORIZON_MINUTES
     areas, found = {}, []
     for new_id in range(1, len(order) + 1):
@@ -204,11 +207,17 @@ def build_nowcast(frame_now, frame_future, now_dt, generated_at):
         for half in (80, 160):
             res = _measure(fa, fb, crow, ccol, half)
             if res:
+                half_used_ = half
                 break
         if res:
             drow, dcol, peak, wr, wc = res
             b, v = _bearing_speed(frame_now, drow, dcol, wr, wc, minutes)
-            areas[str(new_id)] = {"b": int(round(b)) % 360, "v": int(round(v))}
+            if v < SLOW_KMH and fc is not None:
+                res60 = _measure(fa, fc, crow, ccol, half_used_)
+                if res60:
+                    drow, dcol, peak, wr, wc = res60
+                    b, v = _bearing_speed(frame_now, drow, dcol, wr, wc, 2 * minutes)
+            areas[str(new_id)] = {"b": int(round(b)) % 360, "v": round(v, 1)}
             found.append((b, v))
     # Areas where no reliable measurement was possible get the average motion
     # of the others (weather systems in one region move alike).
@@ -216,7 +225,7 @@ def build_nowcast(frame_now, frame_future, now_dt, generated_at):
         sx = sum(math.sin(math.radians(b)) for b, _ in found)
         sy = sum(math.cos(math.radians(b)) for b, _ in found)
         fb_b = int(round(math.degrees(math.atan2(sx, sy)) + 360.0)) % 360
-        fb_v = int(round(sum(v for _, v in found) / len(found)))
+        fb_v = round(sum(v for _, v in found) / len(found), 1)
         for new_id in range(1, len(order) + 1):
             areas.setdefault(str(new_id), {"b": fb_b, "v": fb_v, "est": 1})
     else:
