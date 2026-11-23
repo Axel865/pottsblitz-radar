@@ -10,7 +10,10 @@ name: Render and publish DWD radar tiles
 # unlimited for public repos, while the private main repo's free quota
 # (2,000 min/month) was used up in ~2.5 days by a 5-minute cadence.
 # Nothing secret is in here — credentials are repository secrets:
-#   RADAR_FTP_HOST, RADAR_FTP_USER, RADAR_FTP_PASS, RADAR_TRIGGER_TOKEN
+#   RADAR_FTP_HOST, RADAR_FTP_USER, RADAR_FTP_PASS, RADAR_FTP_PATH,
+#   RADAR_TRIGGER_TOKEN
+# The FTP user is a dedicated, restricted account that only sees the radar
+# upload folder (not the website's main FTP login).
 on:
   workflow_dispatch: {}
 
@@ -48,7 +51,7 @@ jobs:
           curl --ftp-ssl --ftp-create-dirs -sS \
             -u "${{ secrets.RADAR_FTP_USER }}:${{ secrets.RADAR_FTP_PASS }}" \
             -T radar-tiles.zip \
-            "ftp://${{ secrets.RADAR_FTP_HOST }}/radar-tiles-private/incoming.zip"
+            "ftp://${{ secrets.RADAR_FTP_HOST }}/${{ secrets.RADAR_FTP_PATH }}"
 
       - name: Trigger server-side extraction
         run: |
