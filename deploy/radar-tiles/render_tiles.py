@@ -565,12 +565,30 @@ def main():
             total_tiles += n
             print(msg, flush=True)
 
-    meta_path = os.path.join(args.out, "meta.json")
+    import json
     os.makedirs(args.out, exist_ok=True)
+    generated_at = datetime.now(timezone.utc).isoformat()
+
+    # Precipitation areas + their movement for the home-screen tile's arrow
+    # (see nowcast.py). Optional: a failure here only means no arrow.
+    try:
+        from nowcast import build_nowcast
+        by_minute = {int(re.search(r"_(\d+)-hd5", n).group(1)): n for n in latest_members}
+        nc = build_nowcast(decode_member(latest_tar, by_minute[0]),
+                           decode_member(latest_tar, by_minute[30]), now_dt, generated_at)
+        if nc:
+            with open(os.path.join(args.out, "nowcast.json"), "w") as fh:
+                json.dump(nc, fh, separators=(",", ":"))
+            print(f"  nowcast: {len(nc['areas'])} precipitation areas")
+        else:
+            print("  nowcast: no precipitation areas")
+    except Exception as e:
+        print(f"  nowcast unavailable ({e}) — no movement arrow")
+
+    meta_path = os.path.join(args.out, "meta.json")
     with open(meta_path, "w") as fh:
-        import json
         json.dump({
-            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "generated_at": generated_at,
             "now": now_dt.isoformat(),
             "frame_count": FRAME_COUNT,
             "now_index": NOW_INDEX,
