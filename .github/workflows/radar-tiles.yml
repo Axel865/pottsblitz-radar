@@ -46,15 +46,24 @@ jobs:
       - name: Zip tiles
         run: cd tiles && zip -rq ../radar-tiles.zip . && cd ..
 
+      # Secrets go in via env vars, NOT pasted into the script text: a password
+      # with $ ` " \ or ! would otherwise be interpreted by the shell.
       - name: Upload zip via FTPS
+        env:
+          FTP_USER: ${{ secrets.RADAR_FTP_USER }}
+          FTP_PASS: ${{ secrets.RADAR_FTP_PASS }}
+          FTP_HOST: ${{ secrets.RADAR_FTP_HOST }}
+          FTP_PATH: ${{ secrets.RADAR_FTP_PATH }}
         run: |
           curl --ftp-ssl --ftp-create-dirs -sS \
-            -u "${{ secrets.RADAR_FTP_USER }}:${{ secrets.RADAR_FTP_PASS }}" \
+            --user "$FTP_USER:$FTP_PASS" \
             -T radar-tiles.zip \
-            "ftp://${{ secrets.RADAR_FTP_HOST }}/${{ secrets.RADAR_FTP_PATH }}"
+            "ftp://$FTP_HOST/$FTP_PATH"
 
       - name: Trigger server-side extraction
+        env:
+          TRIGGER_TOKEN: ${{ secrets.RADAR_TRIGGER_TOKEN }}
         run: |
-          RESP=$(curl -fsS "https://www.emscherwetter.de/radar-tiles-run.php?t=${{ secrets.RADAR_TRIGGER_TOKEN }}")
+          RESP=$(curl -fsS "https://www.emscherwetter.de/radar-tiles-run.php?t=$TRIGGER_TOKEN")
           echo "Response: $RESP"
           test "$RESP" = "ok"
