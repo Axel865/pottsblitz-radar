@@ -320,8 +320,123 @@ class Flow:
 
 
 def build_forecaster(session, archive, newest, now_dt):
-    """(Flow, pooled newest OPERA frame, ICON-EU run) for forecasting outside
-    the DWD coverage, or raises if the wind is unavailable."""
+    """(Flow, pooled newest OPERA frame, ICON-EU run, (u, v, grid)) for
+    forecasting outside the DWD coverage; raises if the wind is unavailable."""
     frame = pool(archive.fetch(newest), FLOW_POOL)
     u, v, g, run = icon_eu_wind(session, now_dt)
-    return Flow(wind_nodes(frame, u, v, g), frame["dbz"].shape), frame, run
+    return Flow(wind_nodes(frame, u, v, g), frame["dbz"].shape), frame, run, (u, v, g)
+
+
+# ---------------------------------------------------------------------------
+# Movement arrow for all of Europe (nowcast.json, same format as nowcast.py)
+# ---------------------------------------------------------------------------
+EU_LAT0, EU_LAT1, EU_DLAT = 33.0, 70.0, 0.05
+EU_LON0, EU_LON1, EU_DLON = -25.0, 42.0, 0.075
+EU_MIN_CELLS = 10
+EU_MAX_AREAS = 400
+EU_BLOCK_ROWS, EU_BLOCK_COLS = 60, 40   # big frontal bands are cut into ~3 deg blocks:
+                                        # the motion differs along such a band
+
+
+def _sample_wet(frame, wet_px, blur_px, lat_g, lon_g):
+    """Wet fraction of `frame` at lat/lon points, plus coverage and inside masks."""
+    import nowcast
+    to_proj = Transformer.from_crs("EPSG:4326", frame["projdef"], always_xy=True)
+    x, y = to_proj.transform(lon_g.ravel(), lat_g.ravel())
+    col = np.round((np.asarray(x) - frame["ul_x"]) / frame["xscale"]).astype(int).reshape(lat_g.shape)
+    row = np.round((frame["ul_y"] - np.asarray(y)) / frame["yscale"]).astype(int).reshape(lat_g.shape)
+    ys, xs = frame["dbz"].shape
+    inside = (col >= 0) & (col < xs) & (row >= 0) & (row < ys)
+    col, row = np.clip(col, 0, xs - 1), np.clip(row, 0, ys - 1)
+    frac = nowcast._box_fraction(wet_px, blur_px)[row, col]
+    cover = (frame["cover"][row, col] > 0.5) if "cover" in frame else inside
+    return frac, cover & inside, row, col
+
+
+def build_nowcast_europe(dwd_now, dwd_30, dwd_60, opera_base, wind, now_dt, generated_at):
+    """Precipitation areas for all of Europe with their direction of travel:
+    DWD data (measured motion, as nowcast.py) where the DWD coverage is,
+    OPERA (model-wind motion) elsewhere. Returns the nowcast.json dict or None."""
+    import math
+    import nowcast
+    u, v, g = wind
+    lats = EU_LAT0 + EU_DLAT * (np.arange(int(round((EU_LAT1 - EU_LAT0) / EU_DLAT))) + 0.5)
+    lons = EU_LON0 + EU_DLON * (np.arange(int(round((EU_LON1 - EU_LON0) / EU_DLON))) + 0.5)
+    nlat, nlon = len(lats), len(lons)
+    lon_g, lat_g = np.meshgrid(lons, lats)
+
+    wet_d = (dwd_now["dbz"] >= nowcast.MIN_DBZ) & (dwd_now["valid"] > 0)
+    frac_d, use_d, rd, cd = _sample_wet(dwd_now, wet_d, nowcast.BLUR_PX, lat_g, lon_g)
+    wet_o = (opera_base["dbz"] >= OPERA_MIN_DBZ) & (opera_base["valid"] > 0)
+    frac_o, use_o, _, _ = _sample_wet(opera_base, wet_o, 3, lat_g, lon_g)
+    wet = np.where(use_d, frac_d >= nowcast.WET_FRACTION, (frac_o >= nowcast.WET_FRACTION) & use_o)
+    if not wet.any():
+        return None
+
+    labels, sizes = nowcast._label(wet)
+    order = [i for i in np.argsort(sizes)[::-1] if i > 0 and sizes[i] >= EU_MIN_CELLS][:EU_MAX_AREAS]
+    if not order:
+        return None
+    remap = np.zeros(len(sizes), dtype=np.int32)
+    for new_id, old in enumerate(order, start=1):
+        remap[old] = new_id
+    ids = remap[labels]
+    # Cut every area into blocks, each with its own motion (a front from
+    # Iceland to Marseille does not move as one piece).
+    rows_i, cols_i = np.indices(ids.shape)
+    key = np.where(ids > 0, ids.astype(np.int64) * 1_000_000
+                   + (rows_i // EU_BLOCK_ROWS) * 1_000 + (cols_i // EU_BLOCK_COLS), 0)
+    uniq, inv = np.unique(key, return_inverse=True)
+    ids = np.where(ids > 0, inv.reshape(ids.shape), 0).astype(np.int32)
+    if uniq[0] != 0:  # no dry cells at all (never happens) — keep ids starting at 1
+        ids = ids + 1
+    order = list(range(int(ids.max())))
+
+    fa, f30 = nowcast._prep(dwd_now), nowcast._prep(dwd_30)
+    f60 = nowcast._prep(dwd_60) if dwd_60 is not None else None
+    areas = {}
+    for new_id in range(1, len(order) + 1):
+        sel = ids == new_id
+        dwd_share = float(use_d[sel].mean())
+        motion = None
+        if dwd_share >= 0.5:
+            crow, ccol = rd[sel & use_d].mean(), cd[sel & use_d].mean()
+            res, half_used = None, 80
+            for half in (80, 160):
+                res = nowcast._measure(fa, f30, crow, ccol, half)
+                if res:
+                    half_used = half
+                    break
+            if res:
+                drow, dcol, peak, wr, wc = res
+                b, sp = nowcast._bearing_speed(dwd_now, drow, dcol, wr, wc, 30)
+                if sp < nowcast.SLOW_KMH and f60 is not None:
+                    res60 = nowcast._measure(fa, f60, crow, ccol, half_used)
+                    if res60:
+                        drow, dcol, peak, wr, wc = res60
+                        b, sp = nowcast._bearing_speed(dwd_now, drow, dcol, wr, wc, 60)
+                motion = {"b": int(round(b)) % 360, "v": round(sp, 1)}
+        if motion is None:
+            # Model wind at the area's centre (the same wind the forecast moves it with).
+            la, lo = float(lat_g[sel].mean()), float(lon_g[sel].mean())
+            j = int(np.clip(round((la - g["lat0"]) / g["dlat"]), 0, g["nj"] - 1))
+            i = int(np.clip(round((lo - g["lon0"]) / g["dlon"]), 0, g["ni"] - 1))
+            uu, vv = float(u[j, i]) * WIND_FACTOR, float(v[j, i]) * WIND_FACTOR
+            motion = {"b": int(round(math.degrees(math.atan2(uu, vv)))) % 360,
+                      "v": round(math.hypot(uu, vv) * 3.6, 1), "est": 1}
+        areas[str(new_id)] = motion
+
+    flat = ids.ravel()
+    change = np.flatnonzero(np.diff(flat)) + 1
+    starts = np.concatenate(([0], change))
+    counts = np.diff(np.concatenate((starts, [flat.size])))
+    rle = []
+    for st, c in zip(starts, counts):
+        rle.extend([int(flat[st]), int(c)])
+    return {
+        "generated_at": generated_at,
+        "now": now_dt.isoformat(),
+        "grid": {"lat0": EU_LAT0, "lon0": EU_LON0, "dlat": EU_DLAT, "dlon": EU_DLON, "nlat": nlat, "nlon": nlon},
+        "rle": rle,
+        "areas": areas,
+    }

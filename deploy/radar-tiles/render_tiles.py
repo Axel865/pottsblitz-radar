@@ -472,6 +472,16 @@ class SnowField:
     def __init__(self, values, grid):
         self.values, self.g = values, grid
 
+    def edge_weight(self, lat_rows, lon_cols, feather_deg=0.3):
+        """1 well inside this model's area, falling to 0 over `feather_deg`
+        at its edge (and 0 outside) — to hand over to a wider model smoothly."""
+        g = self.g
+        lat_min, lat_max = g["lat0"], g["lat0"] + g["dlat"] * (g["nj"] - 1)
+        lon_min, lon_max = g["lon0"], g["lon0"] + g["dlon"] * (g["ni"] - 1)
+        wj = np.clip(np.minimum(lat_rows - lat_min, lat_max - lat_rows) / feather_deg, 0, 1)
+        wi = np.clip(np.minimum(lon_cols - lon_min, lon_max - lon_cols) / feather_deg, 0, 1)
+        return (wj[:, None] * wi[None, :]).astype(np.float32)
+
     def sample(self, lat_rows, lon_cols):
         """Bilinear lookup for a mosaic given its per-row latitudes and
         per-column longitudes -> (len(lat_rows), len(lon_cols)) array."""
@@ -491,11 +501,106 @@ class SnowField:
 
 
 
+ICON_EU_BASE = "https://opendata.dwd.de/weather/nwp/icon-eu/grib/"
+
+
+def fetch_icon_eu_field(session, run_dt, step, var):
+    """One ICON-EU single-level field on DWD's regular lat/lon grid
+    (see fetch_icon_field for the ICON-D2 twin)."""
+    import bz2
+    import eccodes
+    run = run_dt.strftime("%Y%m%d%H")
+    url = (f"{ICON_EU_BASE}{run_dt:%H}/{var}/"
+           f"icon-eu_europe_regular-lat-lon_single-level_{run}_{step:03d}_{var.upper()}.grib2.bz2")
+    r = session.get(url, timeout=60)
+    r.raise_for_status()
+    h = eccodes.codes_new_from_message(bz2.decompress(r.content))
+    try:
+        ni, nj = eccodes.codes_get(h, "Ni"), eccodes.codes_get(h, "Nj")
+        lat0 = eccodes.codes_get(h, "latitudeOfFirstGridPointInDegrees")
+        lon0 = eccodes.codes_get(h, "longitudeOfFirstGridPointInDegrees")
+        dlat = eccodes.codes_get(h, "jDirectionIncrementInDegrees")
+        dlon = eccodes.codes_get(h, "iDirectionIncrementInDegrees")
+        if not eccodes.codes_get(h, "jScansPositively"):
+            raise ValueError("unexpected ICON-EU scan order")
+        missing = eccodes.codes_get(h, "missingValue")
+        vals = eccodes.codes_get_values(h).astype(np.float32).reshape(nj, ni)
+    finally:
+        eccodes.codes_release(h)
+    vals[vals == missing] = np.nan
+    if lon0 > 180:
+        lon0 -= 360
+    return vals, {"lat0": lat0, "lon0": lon0, "dlat": dlat, "dlon": dlon, "ni": ni, "nj": nj}
+
+
+class SnowModelEU(SnowModel):
+    """Same as SnowModel, but from ICON-EU (all of Europe, ~6 km) instead of
+    ICON-D2 (central Europe only, ~2 km)."""
+
+    def __init__(self, session, t_from, t_to):  # noqa: D107 — same signature, other source
+        now = datetime.utcnow()
+        latest_run = now.replace(minute=0, second=0, microsecond=0)
+        latest_run -= timedelta(hours=latest_run.hour % 3)
+        hours = []
+        h = t_from.replace(minute=0, second=0, microsecond=0)
+        while h <= t_to + timedelta(hours=1):
+            hours.append(h)
+            h += timedelta(hours=1)
+        last_err = None
+        for back in range(0, 5):
+            run = latest_run - timedelta(hours=3 * back)
+            try:
+                self._load(session, run, hours)
+                print(f"  snow detection Europe: ICON-EU run {run:%Y-%m-%d %H} UTC, {len(hours)} hours")
+                return
+            except Exception as e:
+                last_err = e
+        raise RuntimeError(f"no usable ICON-EU run ({last_err})")
+
+    def _load(self, session, run, hours):
+        grids, grid = {}, None
+        for hour in hours:
+            step = max(0, int((hour - run).total_seconds() // 3600))
+            t, grid = fetch_icon_eu_field(session, run, step, "t_2m")
+            td, _ = fetch_icon_eu_field(session, run, step, "td_2m")
+            tw = wet_bulb_c(t - 273.15, td - 273.15)
+            frac = np.clip((SNOW_TW_NONE - tw) / (SNOW_TW_NONE - SNOW_TW_FULL), 0, 1)
+            grids[hour] = np.nan_to_num(frac, nan=0.0).astype(np.float32)
+        self.grids, self.grid = grids, grid
+        self.hours = sorted(grids)
+
+
+class _CombinedSnowField:
+    """ICON-D2 where it exists (feathered at its edge), ICON-EU elsewhere."""
+
+    def __init__(self, fine, wide):
+        self.fine, self.wide = fine, wide
+
+    def sample(self, lat_rows, lon_cols):
+        if self.fine is None:
+            return self.wide.sample(lat_rows, lon_cols)
+        a = self.fine.sample(lat_rows, lon_cols)
+        if self.wide is None:
+            return a
+        w = self.fine.edge_weight(lat_rows, lon_cols)
+        return a * w + self.wide.sample(lat_rows, lon_cols) * (1 - w)
+
+
+class CombinedSnowModel:
+    def __init__(self, fine, wide):
+        self.fine, self.wide = fine, wide
+
+    def at(self, frame_dt):
+        return _CombinedSnowField(self.fine.at(frame_dt) if self.fine else None,
+                                  self.wide.at(frame_dt) if self.wide else None)
+
+
 _LATEST_TAR = None
 _OUT_DIR = None
 _SNOW = None
 _OPERA = None      # europe.OperaArchive when running with --europe
 _FORECAST = None   # (Flow, pooled newest OPERA frame, its time) for the frames after "now"
+_WIND = None       # (u, v, grid) ICON-EU 700 hPa wind, also used for the movement arrow outside the DWD area
 _NOW_DT = None
 _THREAD = threading.local()
 
@@ -586,12 +691,19 @@ def main():
     # Rain vs. snow: the radar only measures intensity, so precipitation
     # type comes from DWD's ICON-D2 model (2 m temperature + dew point). Any
     # failure here just means everything is drawn as rain, never a broken run.
-    global _LATEST_TAR, _OUT_DIR, _SNOW, _OPERA, _NOW_DT, _FORECAST
+    global _LATEST_TAR, _OUT_DIR, _SNOW, _OPERA, _NOW_DT, _FORECAST, _WIND
+    t_span = (now_dt - timedelta(minutes=120), now_dt + timedelta(minutes=120))
+    snow_fine = snow_wide = None
     try:
-        _SNOW = SnowModel(session, now_dt - timedelta(minutes=120), now_dt + timedelta(minutes=120))
+        snow_fine = SnowModel(session, *t_span)
     except Exception as e:
         print(f"  snow detection unavailable ({e}) — drawing everything as rain")
-        _SNOW = None
+    if args.europe:
+        try:
+            snow_wide = SnowModelEU(session, *t_span)
+        except Exception as e:
+            print(f"  snow detection for Europe unavailable ({e})")
+    _SNOW = CombinedSnowModel(snow_fine, snow_wide) if (snow_fine or snow_wide) else None
     _NOW_DT = now_dt
     if args.europe:
         try:
@@ -600,8 +712,9 @@ def main():
             newest = max(t for t in _OPERA.times if t <= now_dt)
             print(f"  OPERA: {len(_OPERA.times)} composites, newest {newest:%H:%M} (DWD now {now_dt:%H:%M})")
             try:
-                flow, base, run = eu.build_forecaster(session, _OPERA, newest, now_dt)
+                flow, base, run, wind = eu.build_forecaster(session, _OPERA, newest, now_dt)
                 _FORECAST = (flow, base, newest)
+                _WIND = wind
                 print(f"  forecast outside the DWD area: OPERA {newest:%H:%M} moved with ICON-EU {run:%H} UTC 700 hPa wind")
             except Exception as e:
                 print(f"  no wind for the forecast ({e}) — frames after now show Germany only")
@@ -635,10 +748,17 @@ def main():
     # (see nowcast.py). Optional: a failure here only means no arrow.
     try:
         from nowcast import build_nowcast
+        import europe as eu
         by_minute = {int(re.search(r"_(\d+)-hd5", n).group(1)): n for n in latest_members}
-        nc = build_nowcast(decode_member(latest_tar, by_minute[0]),
-                           decode_member(latest_tar, by_minute[30]), now_dt, generated_at,
-                           decode_member(latest_tar, by_minute[60]) if 60 in by_minute else None)
+        if _FORECAST is not None and _WIND is not None:
+            nc = eu.build_nowcast_europe(
+                decode_member(latest_tar, by_minute[0]), decode_member(latest_tar, by_minute[30]),
+                decode_member(latest_tar, by_minute[60]) if 60 in by_minute else None,
+                _FORECAST[1], _WIND, now_dt, generated_at)
+        else:
+            nc = build_nowcast(decode_member(latest_tar, by_minute[0]),
+                               decode_member(latest_tar, by_minute[30]), now_dt, generated_at,
+                               decode_member(latest_tar, by_minute[60]) if 60 in by_minute else None)
         if nc:
             with open(os.path.join(args.out, "nowcast.json"), "w") as fh:
                 json.dump(nc, fh, separators=(",", ":"))
