@@ -375,6 +375,11 @@ def coverage_raster(dwd_now, opera_base):
     lons = EU_LON0 + COV_DLON * (np.arange(int(round((EU_LON1 - EU_LON0) / COV_DLON))) + 0.5)
     lon_g, lat_g = np.meshgrid(lons, lats)
     cov = (_covered(dwd_now, lat_g, lon_g) | _covered(opera_base, lat_g, lon_g)).astype(np.int8)
+    # Erode by one cell (~28 km): a place right at the edge of the radar
+    # coverage (Rome sits on it) would otherwise get a map that is often empty
+    # although it rains — Windy is the better choice there.
+    pad = np.pad(cov, 1)
+    cov = np.min([pad[i:i + cov.shape[0], j:j + cov.shape[1]] for i in range(3) for j in range(3)], axis=0)
     flat = cov.ravel()
     starts = np.concatenate(([0], np.flatnonzero(np.diff(flat)) + 1))
     counts = np.diff(np.concatenate((starts, [flat.size])))
