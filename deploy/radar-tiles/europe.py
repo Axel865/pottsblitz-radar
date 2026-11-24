@@ -155,7 +155,9 @@ def blended_mosaic(render, dwd, opera, zoom, xt0, yt0, xt1, yt1, k, snow):
     valid_d = _lerp4(geo, d["valid"]) * inside_d
     if opera is None:
         return render.colorize(dbz_d, valid_d, h, w, _snow(snow, geo))
-    o = pool(opera, k)
+    # `k` is the target resolution in km; an advected OPERA frame already sits
+    # on a coarser (2 km) grid.
+    o = pool(opera, max(1, int(round(k * 1000.0 / opera["xscale"]))))
     geo_o = render.tier_geometry(o, zoom, xt0, yt0, xt1, yt1)
     dbz_o = _lerp4(geo_o, o["dbz"])
     valid_o = _lerp4(geo_o, o["valid"]) * geo_o["inside"]
@@ -172,3 +174,154 @@ def blended_mosaic(render, dwd, opera, zoom, xt0, yt0, xt1, yt1, k, snow):
 
 def _snow(snow, geo):
     return snow.sample(geo["lat_rows"], geo["lon_cols"]) if snow is not None else None
+
+
+# ---------------------------------------------------------------------------
+# Forecast outside the DWD domain: move the newest OPERA frame with the wind
+# ---------------------------------------------------------------------------
+# The DWD nowcast only exists inside its own coverage. Outside it, the newest
+# OPERA frame is advected with the 700 hPa wind of DWD's ICON-EU model.
+#
+# Why the wind and not a motion measured from the last OPERA frames (as
+# nowcast.py does for DWD data): the OPERA composite carries lots of static
+# echoes plus persistent frontal bands, and every variant tried (phase
+# correlation, normalised cross-correlation, several window sizes, masking of
+# static pixels) got pinned to ~zero motion or noise and did not beat simply
+# freezing the picture in a hindcast against real OPERA frames. The model wind
+# did, by a small margin up to +60 min, and it never produces noise vectors.
+FLOW_POOL = 2          # advected frames use a 2 km grid
+FLOW_NODE_PX = 32      # wind sampled every 32 px (= 64 km), interpolated between
+WIND_LEVEL = 700       # hPa
+WIND_FACTOR = 0.8      # rain systems move a bit slower than the 700 hPa wind
+ICON_EU_BASE = "https://opendata.dwd.de/weather/nwp/icon-eu/grib/"
+
+
+def _icon_eu_field(session, run, step, var, level):
+    import bz2
+    import eccodes
+    url = (f"{ICON_EU_BASE}{run:%H}/{var.lower()}/icon-eu_europe_regular-lat-lon_pressure-level_"
+           f"{run:%Y%m%d%H}_{step:03d}_{level}_{var}.grib2.bz2")
+    r = session.get(url, timeout=60)
+    r.raise_for_status()
+    h = eccodes.codes_new_from_message(bz2.decompress(r.content))
+    try:
+        g = {k: eccodes.codes_get(h, k) for k in (
+            "Ni", "Nj", "latitudeOfFirstGridPointInDegrees", "longitudeOfFirstGridPointInDegrees",
+            "iDirectionIncrementInDegrees", "jDirectionIncrementInDegrees", "jScansPositively")}
+        if not g["jScansPositively"]:
+            raise ValueError("unexpected ICON-EU scan order")
+        vals = eccodes.codes_get_values(h).astype(np.float32).reshape(g["Nj"], g["Ni"])
+    finally:
+        eccodes.codes_release(h)
+    lon0 = g["longitudeOfFirstGridPointInDegrees"]
+    if lon0 > 180:
+        lon0 -= 360
+    return vals, {"lat0": g["latitudeOfFirstGridPointInDegrees"], "lon0": lon0,
+                  "dlat": g["jDirectionIncrementInDegrees"], "dlon": g["iDirectionIncrementInDegrees"],
+                  "ni": g["Ni"], "nj": g["Nj"]}
+
+
+def icon_eu_wind(session, now_dt):
+    """(u, v, grid, run_dt) 700 hPa wind [m/s] of the newest ICON-EU run
+    that is already online, at the model hour nearest to now."""
+    latest = now_dt.replace(minute=0, second=0, microsecond=0)
+    latest -= timedelta(hours=latest.hour % 3)
+    last = None
+    for back in range(0, 5):
+        run = latest - timedelta(hours=3 * back)
+        step = int(round((now_dt - run).total_seconds() / 3600.0))
+        try:
+            u, g = _icon_eu_field(session, run, step, "U", WIND_LEVEL)
+            v, _ = _icon_eu_field(session, run, step, "V", WIND_LEVEL)
+            return u, v, g, run
+        except Exception as e:
+            last = e
+    raise RuntimeError(f"no usable ICON-EU run ({last})")
+
+
+def wind_nodes(frame, u, v, g):
+    """Wind sampled at a coarse node grid of the (pooled) OPERA frame and
+    converted to pixel motion per minute (rows down, cols right)."""
+    h, w = frame["dbz"].shape
+    node = FLOW_NODE_PX
+    ny, nx = h // node, w // node
+    inv = Transformer.from_crs(frame["projdef"], "EPSG:4326", always_xy=True)
+    fwd = Transformer.from_crs("EPSG:4326", frame["projdef"], always_xy=True)
+    rr, cc = np.meshgrid((np.arange(ny) + 0.5) * node, (np.arange(nx) + 0.5) * node, indexing="ij")
+    x = frame["ul_x"] + cc * frame["xscale"]
+    y = frame["ul_y"] - rr * frame["yscale"]
+    lon, lat = (np.asarray(a) for a in inv.transform(x, y))
+    # Unit vectors east / north in grid axes (the LAEA grid is rotated against
+    # true north depending on longitude).
+    e = 0.01
+    xe, ye = fwd.transform(lon + e, lat)
+    xn, yn = fwd.transform(lon, lat + e)
+    ex, ey = np.asarray(xe) - x, np.asarray(ye) - y
+    n1 = np.hypot(ex, ey)
+    ex, ey = ex / n1, ey / n1
+    nx_, ny_ = np.asarray(xn) - x, np.asarray(yn) - y
+    n2 = np.hypot(nx_, ny_)
+    nx_, ny_ = nx_ / n2, ny_ / n2
+    fj = np.clip(np.round((lat - g["lat0"]) / g["dlat"]).astype(int), 0, g["nj"] - 1)
+    fi = np.clip(np.round((lon - g["lon0"]) / g["dlon"]).astype(int), 0, g["ni"] - 1)
+    uu, vv = u[fj, fi] * WIND_FACTOR, v[fj, fi] * WIND_FACTOR
+    dx = uu * ex + vv * nx_    # m/s along the grid's x axis (right)
+    dy = uu * ey + vv * ny_    # m/s along the grid's y axis (up)
+    return (-dy * 60.0 / frame["yscale"]).astype(np.float32), (dx * 60.0 / frame["xscale"]).astype(np.float32)
+
+
+class Flow:
+    """Motion field upsampled to the frame grid, with a bilinear advection."""
+
+    def __init__(self, nodes, shape):
+        vr, vc = nodes
+        h, w = shape
+        S = FLOW_NODE_PX
+        ny, nx = vr.shape
+        gy = (np.arange(h) - S / 2.0) / S
+        gx = (np.arange(w) - S / 2.0) / S
+        r0 = np.clip(np.floor(gy).astype(int), 0, ny - 2)
+        c0 = np.clip(np.floor(gx).astype(int), 0, nx - 2)
+        fr = np.clip(gy - r0, 0, 1).astype(np.float32)[:, None]
+        fc = np.clip(gx - c0, 0, 1).astype(np.float32)[None, :]
+
+        def up(a):
+            top = a[r0][:, c0] * (1 - fc) + a[r0][:, c0 + 1] * fc
+            bot = a[r0 + 1][:, c0] * (1 - fc) + a[r0 + 1][:, c0 + 1] * fc
+            return (top * (1 - fr) + bot * fr).astype(np.float32)
+
+        self.vr, self.vc = up(vr), up(vc)
+        self.h, self.w = h, w
+        self.rr = np.arange(h, dtype=np.float32)[:, None]
+        self.cc = np.arange(w, dtype=np.float32)[None, :]
+
+    def advect(self, frame, minutes):
+        """The frame as it will look `minutes` later (semi-Lagrangian,
+        single backward step with the constant flow)."""
+        sr = self.rr - self.vr * minutes
+        sc = self.cc - self.vc * minutes
+        inside = (sr >= 0) & (sr <= self.h - 1) & (sc >= 0) & (sc <= self.w - 1)
+        sr = np.clip(sr, 0, self.h - 1.001)
+        sc = np.clip(sc, 0, self.w - 1.001)
+        r0, c0 = sr.astype(np.int32), sc.astype(np.int32)
+        fr, fc = sr - r0, sc - c0
+        idx = r0 * self.w + c0
+
+        def warp(grid):
+            g = grid.ravel()
+            v00, v10 = g.take(idx), g.take(idx + 1)
+            v01, v11 = g.take(idx + self.w), g.take(idx + self.w + 1)
+            return (v00 * (1 - fc) + v10 * fc) * (1 - fr) + (v01 * (1 - fc) + v11 * fc) * fr
+
+        out = {k: v for k, v in frame.items() if k not in ("cover", "weight")}
+        out["dbz"] = np.where(inside, warp(frame["dbz"]), np.float32(-30.0)).astype(np.float32)
+        out["valid"] = (warp(frame["valid"]) * inside).astype(np.float32)
+        return out
+
+
+def build_forecaster(session, archive, newest, now_dt):
+    """(Flow, pooled newest OPERA frame, ICON-EU run) for forecasting outside
+    the DWD coverage, or raises if the wind is unavailable."""
+    frame = pool(archive.fetch(newest), FLOW_POOL)
+    u, v, g, run = icon_eu_wind(session, now_dt)
+    return Flow(wind_nodes(frame, u, v, g), frame["dbz"].shape), frame, run

@@ -495,6 +495,7 @@ _LATEST_TAR = None
 _OUT_DIR = None
 _SNOW = None
 _OPERA = None      # europe.OperaArchive when running with --europe
+_FORECAST = None   # (Flow, pooled newest OPERA frame, its time) for the frames after "now"
 _NOW_DT = None
 _THREAD = threading.local()
 
@@ -525,6 +526,12 @@ def render_job(job):
                 note = f", OPERA {t:%H:%M}"
             else:
                 note = ", no OPERA frame"
+        elif _OPERA is not None and _FORECAST is not None:
+            # Beyond "now": outside the DWD coverage the newest OPERA frame
+            # is moved with the model wind (the DWD nowcast covers its own area).
+            flow, base, base_dt = _FORECAST
+            opera = flow.advect(base, (frame_dt - base_dt).total_seconds() / 60.0)
+            note = f", OPERA {base_dt:%H:%M} advected"
         n = render_frame_tiles(frame, _OUT_DIR, label, snow, opera, europe=_OPERA is not None)
         return label, n, f"  {label} ({desc}{note}): {n} tiles"
     except Exception as e:
@@ -579,7 +586,7 @@ def main():
     # Rain vs. snow: the radar only measures intensity, so precipitation
     # type comes from DWD's ICON-D2 model (2 m temperature + dew point). Any
     # failure here just means everything is drawn as rain, never a broken run.
-    global _LATEST_TAR, _OUT_DIR, _SNOW, _OPERA, _NOW_DT
+    global _LATEST_TAR, _OUT_DIR, _SNOW, _OPERA, _NOW_DT, _FORECAST
     try:
         _SNOW = SnowModel(session, now_dt - timedelta(minutes=120), now_dt + timedelta(minutes=120))
     except Exception as e:
@@ -592,6 +599,12 @@ def main():
             _OPERA = eu.OperaArchive(session, now_dt - timedelta(minutes=125), now_dt)
             newest = max(t for t in _OPERA.times if t <= now_dt)
             print(f"  OPERA: {len(_OPERA.times)} composites, newest {newest:%H:%M} (DWD now {now_dt:%H:%M})")
+            try:
+                flow, base, run = eu.build_forecaster(session, _OPERA, newest, now_dt)
+                _FORECAST = (flow, base, newest)
+                print(f"  forecast outside the DWD area: OPERA {newest:%H:%M} moved with ICON-EU {run:%H} UTC 700 hPa wind")
+            except Exception as e:
+                print(f"  no wind for the forecast ({e}) — frames after now show Germany only")
         except Exception as e:
             print(f"  OPERA unavailable ({e}) — Germany only")
             _OPERA = None
