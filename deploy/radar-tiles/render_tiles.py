@@ -62,6 +62,28 @@ ZOOM_TIERS = [
     {"zoom": 13, "min_lon": 6.9, "max_lon": 7.3, "min_lat": 51.35, "max_lat": 51.65},
 ]
 
+# Europe mode (--europe): OPERA composite outside the DWD coverage, blended at
+# its edge (see europe.py). Coarse tiers for all of Europe; "k" = how many
+# source pixels (1 km) are averaged into one for that zoom level.
+EUROPE_BOX = {"min_lon": -25.0, "max_lon": 42.0, "min_lat": 33.0, "max_lat": 70.0}
+EUROPE_TIERS = [
+    dict(EUROPE_BOX, zoom=4, europe=True, k=6),
+    dict(EUROPE_BOX, zoom=5, europe=True, k=3),
+    dict(EUROPE_BOX, zoom=6, europe=True, k=1),
+    # z8 keeps its Germany-sized box but gets OPERA where the DWD coverage ends
+    {"zoom": 8, "min_lon": 3.0, "max_lon": 16.0, "min_lat": 46.5, "max_lat": 55.5, "europe": True, "k": 1},
+]
+
+
+def active_tiers(europe):
+    if not europe:
+        return ZOOM_TIERS
+    by_zoom = {t["zoom"]: t for t in ZOOM_TIERS}
+    for t in EUROPE_TIERS:
+        by_zoom[t["zoom"]] = t
+    return [by_zoom[z] for z in sorted(by_zoom)]
+
+
 FRAME_COUNT = 49  # 24 past (-120..-5 min, 5-min steps) + now + 24 future (+5..+120)
 NOW_INDEX = 24
 
@@ -183,7 +205,7 @@ def decode_member(tar, member_name):
     valid = ((data != nodata) & (data != undetect)).astype(np.float32)
     dbz_filled = np.where(valid > 0, dbz, np.float32(-30.0)).astype(np.float32)
     return {
-        "dbz": dbz_filled, "valid": valid, "projdef": projdef,
+        "dbz": dbz_filled, "valid": valid, "cover": (data != nodata).astype(np.float32), "projdef": projdef,
         "xsize": xsize, "ysize": ysize, "xscale": xscale, "yscale": yscale,
         "ul_x": ul_x, "ul_y": ul_y,
     }
@@ -319,13 +341,18 @@ def tile_range_for_box(zoom, min_lon, max_lon, min_lat, max_lat):
     return xt0, yt0, xt1, yt1
 
 
-def render_frame_tiles(frame, out_dir, frame_label, snow=None):
+def render_frame_tiles(frame, out_dir, frame_label, snow=None, opera=None, europe=False):
     n_written = 0
-    for tier in ZOOM_TIERS:
+    for tier in active_tiers(europe):
         zoom = tier["zoom"]
         xt0, yt0, xt1, yt1 = tile_range_for_box(
             zoom, tier["min_lon"], tier["max_lon"], tier["min_lat"], tier["max_lat"])
-        mosaic = render_tier_mosaic(frame, zoom, xt0, yt0, xt1, yt1, snow)
+        if tier.get("europe"):
+            import europe as eu
+            mosaic = eu.blended_mosaic(sys.modules[__name__], frame, opera, zoom, xt0, yt0, xt1, yt1,
+                                       tier["k"], snow)
+        else:
+            mosaic = render_tier_mosaic(frame, zoom, xt0, yt0, xt1, yt1, snow)
         for xi, xt in enumerate(range(xt0, xt1 + 1)):
             for yi, yt in enumerate(range(yt0, yt1 + 1)):
                 chunk = mosaic[yi * TILE:(yi + 1) * TILE, xi * TILE:(xi + 1) * TILE]
@@ -467,6 +494,8 @@ class SnowField:
 _LATEST_TAR = None
 _OUT_DIR = None
 _SNOW = None
+_OPERA = None      # europe.OperaArchive when running with --europe
+_NOW_DT = None
 _THREAD = threading.local()
 
 
@@ -488,8 +517,16 @@ def render_job(job):
                 return label, 0, f"  {label}: member missing in {src}.tar, skipping"
             frame = decode_member(tar, member)
         snow = _SNOW.at(frame_dt) if _SNOW is not None else None
-        n = render_frame_tiles(frame, _OUT_DIR, label, snow)
-        return label, n, f"  {label} ({desc}): {n} tiles"
+        opera, note = None, ""
+        if _OPERA is not None and frame_dt <= _NOW_DT:
+            t = _OPERA.nearest(frame_dt)
+            if t is not None:
+                opera = _OPERA.fetch(t)
+                note = f", OPERA {t:%H:%M}"
+            else:
+                note = ", no OPERA frame"
+        n = render_frame_tiles(frame, _OUT_DIR, label, snow, opera, europe=_OPERA is not None)
+        return label, n, f"  {label} ({desc}{note}): {n} tiles"
     except Exception as e:
         return label, 0, f"  {label} ({desc}): failed ({e}), skipping"
 
@@ -497,6 +534,8 @@ def render_job(job):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True, help="Output directory for the tile tree")
+    ap.add_argument("--europe", action="store_true",
+                    help="also render Europe-wide tiles using the OPERA composite (see europe.py)")
     args = ap.parse_args()
 
     session = requests.Session()
@@ -540,12 +579,22 @@ def main():
     # Rain vs. snow: the radar only measures intensity, so precipitation
     # type comes from DWD's ICON-D2 model (2 m temperature + dew point). Any
     # failure here just means everything is drawn as rain, never a broken run.
-    global _LATEST_TAR, _OUT_DIR, _SNOW
+    global _LATEST_TAR, _OUT_DIR, _SNOW, _OPERA, _NOW_DT
     try:
         _SNOW = SnowModel(session, now_dt - timedelta(minutes=120), now_dt + timedelta(minutes=120))
     except Exception as e:
         print(f"  snow detection unavailable ({e}) — drawing everything as rain")
         _SNOW = None
+    _NOW_DT = now_dt
+    if args.europe:
+        try:
+            import europe as eu
+            _OPERA = eu.OperaArchive(session, now_dt - timedelta(minutes=125), now_dt)
+            newest = max(t for t in _OPERA.times if t <= now_dt)
+            print(f"  OPERA: {len(_OPERA.times)} composites, newest {newest:%H:%M} (DWD now {now_dt:%H:%M})")
+        except Exception as e:
+            print(f"  OPERA unavailable ({e}) — Germany only")
+            _OPERA = None
     _LATEST_TAR, _OUT_DIR = latest_tar, args.out
     first, rest = jobs[0], jobs[1:]
     total_tiles = 0
@@ -594,7 +643,8 @@ def main():
             "frame_count": FRAME_COUNT,
             "now_index": NOW_INDEX,
             "step_minutes": 5,
-            "zooms": [t["zoom"] for t in ZOOM_TIERS],
+            "zooms": [t["zoom"] for t in active_tiers(_OPERA is not None)],
+            "europe": _OPERA is not None,
         }, fh)
 
     print(f"Done. {total_tiles} tiles written to {args.out}")
