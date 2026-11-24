@@ -353,6 +353,38 @@ def _sample_wet(frame, wet_px, blur_px, lat_g, lon_g):
     return frac, cover & inside, row, col
 
 
+COV_DLAT = COV_DLON = 0.25   # coarse coverage raster (where our radar has data at all)
+
+
+def _covered(frame, lat_g, lon_g):
+    to_proj = Transformer.from_crs("EPSG:4326", frame["projdef"], always_xy=True)
+    x, y = to_proj.transform(lon_g.ravel(), lat_g.ravel())
+    col = np.round((np.asarray(x) - frame["ul_x"]) / frame["xscale"]).astype(int).reshape(lat_g.shape)
+    row = np.round((frame["ul_y"] - np.asarray(y)) / frame["yscale"]).astype(int).reshape(lat_g.shape)
+    ys, xs = frame["dbz"].shape
+    inside = (col >= 0) & (col < xs) & (row >= 0) & (row < ys)
+    col, row = np.clip(col, 0, xs - 1), np.clip(row, 0, ys - 1)
+    return inside & (frame["cover"][row, col] > 0.5)
+
+
+def coverage_raster(dwd_now, opera_base):
+    """Where either radar has data (1) — so the app can fall back to Windy for
+    places neither covers (e.g. Turkey, North Africa) instead of showing an
+    empty map that looks like "no rain". Run-length encoded like the areas."""
+    lats = EU_LAT0 + COV_DLAT * (np.arange(int(round((EU_LAT1 - EU_LAT0) / COV_DLAT))) + 0.5)
+    lons = EU_LON0 + COV_DLON * (np.arange(int(round((EU_LON1 - EU_LON0) / COV_DLON))) + 0.5)
+    lon_g, lat_g = np.meshgrid(lons, lats)
+    cov = (_covered(dwd_now, lat_g, lon_g) | _covered(opera_base, lat_g, lon_g)).astype(np.int8)
+    flat = cov.ravel()
+    starts = np.concatenate(([0], np.flatnonzero(np.diff(flat)) + 1))
+    counts = np.diff(np.concatenate((starts, [flat.size])))
+    rle = []
+    for st, c in zip(starts, counts):
+        rle.extend([int(flat[st]), int(c)])
+    return {"lat0": EU_LAT0, "lon0": EU_LON0, "dlat": COV_DLAT, "dlon": COV_DLON,
+            "nlat": len(lats), "nlon": len(lons), "rle": rle}
+
+
 def build_nowcast_europe(dwd_now, dwd_30, dwd_60, opera_base, wind, now_dt, generated_at):
     """Precipitation areas for all of Europe with their direction of travel:
     DWD data (measured motion, as nowcast.py) where the DWD coverage is,
@@ -439,4 +471,5 @@ def build_nowcast_europe(dwd_now, dwd_30, dwd_60, opera_base, wind, now_dt, gene
         "grid": {"lat0": EU_LAT0, "lon0": EU_LON0, "dlat": EU_DLAT, "dlon": EU_DLON, "nlat": nlat, "nlon": nlon},
         "rle": rle,
         "areas": areas,
+        "cov": coverage_raster(dwd_now, opera_base),
     }

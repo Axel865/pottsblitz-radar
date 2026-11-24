@@ -41,7 +41,7 @@ jobs:
         run: pip install -r deploy/radar-tiles/requirements.txt
 
       - name: Render tiles
-        run: python3 deploy/radar-tiles/render_tiles.py --out ./tiles
+        run: python3 deploy/radar-tiles/render_tiles.py --out ./tiles --europe
 
       - name: Zip tiles
         run: cd tiles && zip -rq ../radar-tiles.zip . && cd ..
