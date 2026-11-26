@@ -422,6 +422,25 @@ SNOW_TW_FULL = 0.5
 SNOW_TW_NONE = 1.5
 
 
+def _feathered_validity(valid, box=31):
+    """1 well inside the area where the model has data, falling to 0 at its
+    (possibly tilted) edge over ~box/2 cells, 0 where there is no data."""
+    m = valid.astype(np.float32)
+    c = np.pad(m.cumsum(0).cumsum(1), ((1, 0), (1, 0)))
+    h, w = m.shape
+    r = box // 2
+    y0 = np.clip(np.arange(h) - r, 0, h)
+    y1 = np.clip(np.arange(h) + r + 1, 0, h)
+    x0 = np.clip(np.arange(w) - r, 0, w)
+    x1 = np.clip(np.arange(w) + r + 1, 0, w)
+    tot = c[y1][:, x1] - c[y0][:, x1] - c[y1][:, x0] + c[y0][:, x0]
+    area = ((y1 - y0)[:, None] * (x1 - x0)[None, :]).astype(np.float32)
+    # Cells beyond the grid border count as "valid" (those are handled by the
+    # lat/lon edge weight); only real NaN cells pull the weight down.
+    frac = tot / area
+    return (np.clip((frac - 0.5) * 2.0, 0, 1) * m).astype(np.float32)
+
+
 class SnowModel:
     """Hourly snow-fraction grids (0 = rain, 1 = snow) for the time span the
     animation covers, from the newest ICON-D2 run that has all needed steps."""
@@ -456,7 +475,11 @@ class SnowModel:
             tw = wet_bulb_c(t - 273.15, td - 273.15)
             frac = np.clip((SNOW_TW_NONE - tw) / (SNOW_TW_NONE - SNOW_TW_FULL), 0, 1)
             grids[hour] = np.nan_to_num(frac, nan=0.0).astype(np.float32)
+            valid = ~np.isnan(frac)
         self.grids, self.grid = grids, grid
+        # The model's real area is a tilted trapezoid inside the rectangular
+        # lat/lon grid; the rest is NaN. It must NOT count as "rain" (0).
+        self.weight = _feathered_validity(valid)
         self.hours = sorted(grids)
 
     def at(self, frame_dt):
@@ -466,12 +489,12 @@ class SnowModel:
         h0 = min(max(h0, self.hours[0]), self.hours[-1])
         h1 = min(h0 + timedelta(hours=1), self.hours[-1])
         w1 = min(max((frame_dt - h0).total_seconds() / 3600.0, 0.0), 1.0) if h1 != h0 else 0.0
-        return SnowField(self.grids[h0] * (1 - w1) + self.grids[h1] * w1, self.grid)
+        return SnowField(self.grids[h0] * (1 - w1) + self.grids[h1] * w1, self.grid, self.weight)
 
 
 class SnowField:
-    def __init__(self, values, grid):
-        self.values, self.g = values, grid
+    def __init__(self, values, grid, weight=None):
+        self.values, self.g, self.weight = values, grid, weight
 
     def edge_weight(self, lat_rows, lon_cols, feather_deg=0.3):
         """1 well inside this model's area, falling to 0 over `feather_deg`
@@ -481,11 +504,17 @@ class SnowField:
         lon_min, lon_max = g["lon0"], g["lon0"] + g["dlon"] * (g["ni"] - 1)
         wj = np.clip(np.minimum(lat_rows - lat_min, lat_max - lat_rows) / feather_deg, 0, 1)
         wi = np.clip(np.minimum(lon_cols - lon_min, lon_max - lon_cols) / feather_deg, 0, 1)
-        return (wj[:, None] * wi[None, :]).astype(np.float32)
+        w = (wj[:, None] * wi[None, :]).astype(np.float32)
+        if self.weight is not None:  # no-data (NaN) area inside the grid, e.g. ICON-D2's tilted edge
+            w = w * self._bilerp(self.weight, lat_rows, lon_cols)
+        return w
 
     def sample(self, lat_rows, lon_cols):
         """Bilinear lookup for a mosaic given its per-row latitudes and
         per-column longitudes -> (len(lat_rows), len(lon_cols)) array."""
+        return self._bilerp(self.values, lat_rows, lon_cols)
+
+    def _bilerp(self, values, lat_rows, lon_cols):
         g = self.g
         fj = (lat_rows - g["lat0"]) / g["dlat"]
         fi = (lon_cols - g["lon0"]) / g["dlon"]
@@ -495,7 +524,7 @@ class SnowField:
         i0 = np.clip(np.floor(fi).astype(np.int32), 0, g["ni"] - 2)
         wj = np.clip(fj - j0, 0, 1).astype(np.float32)[:, None]
         wi = np.clip(fi - i0, 0, 1).astype(np.float32)[None, :]
-        rows = self.values[j0] * (1 - wj) + self.values[j0 + 1] * wj  # (h, Ni)
+        rows = values[j0] * (1 - wj) + values[j0 + 1] * wj  # (h, Ni)
         out = rows[:, i0] * (1 - wi) + rows[:, i0 + 1] * wi
         out *= inside_j[:, None] & inside_i[None, :]
         return out
@@ -560,6 +589,7 @@ class SnowModelEU(SnowModel):
 
     def _load(self, session, run, hours):
         grids, grid = {}, None
+        valid = None
         for hour in hours:
             step = max(0, int((hour - run).total_seconds() // 3600))
             t, grid = fetch_icon_eu_field(session, run, step, "t_2m")
@@ -567,7 +597,9 @@ class SnowModelEU(SnowModel):
             tw = wet_bulb_c(t - 273.15, td - 273.15)
             frac = np.clip((SNOW_TW_NONE - tw) / (SNOW_TW_NONE - SNOW_TW_FULL), 0, 1)
             grids[hour] = np.nan_to_num(frac, nan=0.0).astype(np.float32)
+            valid = ~np.isnan(frac)
         self.grids, self.grid = grids, grid
+        self.weight = _feathered_validity(valid)
         self.hours = sorted(grids)
 
 
