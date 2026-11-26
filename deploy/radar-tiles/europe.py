@@ -25,7 +25,7 @@ OPERA_ENDPOINTS = [
     "https://s3.waw3-1.cloudferro.com/openradar-24h",
     "https://object-store.os-api.cci1.ecmwf.int/openradar-24h-backup",
 ]
-OPERA_MIN_DBZ = 14.0     # OPERA shows more weak echoes (clutter) than the DWD one
+OPERA_MIN_DBZ = 9.8      # same 0.15 mm/h as everywhere (was 14; OPERA has more weak clutter — watch it)
 OPERA_MAX_AGE_MIN = 15   # use an older OPERA frame if the newest is still missing
 SEAM_KM = 30             # blend width inside the DWD coverage
 

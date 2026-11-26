@@ -31,7 +31,7 @@ from pyproj import Transformer
 LAT0, LAT1, DLAT = 45.5, 56.0, 0.04
 LON0, LON1, DLON = 1.5, 19.0, 0.05
 
-MIN_DBZ = 12.0        # same threshold the tiles use (~0.2 mm/h)
+MIN_DBZ = 9.8         # same threshold the tiles use (0.15 mm/h)
 BLUR_PX = 5           # box size (km) for the "is this cell wet" fraction
 WET_FRACTION = 0.35   # share of wet 1 km pixels around a cell to count it as wet
 MIN_CELLS = 15        # ignore specks smaller than ~15 cells (~190 km2)

@@ -298,12 +298,13 @@ def render_tier_mosaic(frame, zoom, xt0, yt0, xt1, yt1, snow=None):
     return colorize(dbz, valid, h, w, snow_frac)
 
 
-# Below ~12 dBZ is less than 0.2 mm/h (Marshall-Palmer, Z = 200 R^1.6) — the
+# Below ~9.8 dBZ is less than 0.15 mm/h (Marshall-Palmer, Z = 200 R^1.6) — the
 # pale-blue haze that is mostly drizzle-at-best and radar clutter (ground
-# echoes, wind farms, fog). Was 7 dBZ (0.1 mm/h); raised on request. Not
+# echoes, wind farms, fog). One threshold for everything: tiles, nowcast,
+# app bar, widgets (0.15 mm/h). Was 7 dBZ, then 12 dBZ (0.2 mm/h). Not
 # drawn at all; fade in over the next few dBZ so the edge of a rain area
 # stays soft instead of a hard cut.
-MIN_DBZ = 12.0
+MIN_DBZ = 9.8
 FADE_DBZ = 4.0
 
 
